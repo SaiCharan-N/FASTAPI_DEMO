@@ -1,18 +1,23 @@
-from fastapi import FastAPI, File, UploadFile
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from pydantic import BaseModel
+from typing import List
 import numpy as np
 import tensorflow as tf
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import io
 
-app = FastAPI()
+app = FastAPI(title="Plant Disease Detection API")
 
 # -----------------------------
 # Load Model
 # -----------------------------
-model = tf.keras.models.load_model("plantAID_final.keras")
+try:
+    model = tf.keras.models.load_model("plantAID_final.keras")
+except Exception as e:
+    raise RuntimeError(f"Model failed to load: {e}")
 
 # -----------------------------
-# Class Labels (from your JSON)
+# Class Labels
 # -----------------------------
 class_names = [
     "Corn___Common_Rust",
@@ -35,48 +40,112 @@ class_names = [
 ]
 
 # -----------------------------
-# Image Preprocessing Function
+# Schemas
+# -----------------------------
+class Prediction(BaseModel):
+    class_name: str
+    confidence: float
+
+class PredictionResponse(BaseModel):
+    predictions: List[Prediction]
+
+class HealthResponse(BaseModel):
+    status: str
+
+class ModelInfoResponse(BaseModel):
+    model_name: str
+    input_shape: List[int]
+    total_classes: int
+
+class ErrorResponse(BaseModel):
+    error: str
+
+# -----------------------------
+# Preprocessing
 # -----------------------------
 def preprocess_image(image: Image.Image):
-    image = image.resize((160, 160))   # ⚠️ must match training size
-    image = np.array(image)
+    try:
+        input_shape = model.input_shape[1:3]
+        image = image.resize(input_shape)
 
-    if image.shape[-1] == 4:  # remove alpha channel if present
-        image = image[:, :, :3]
+        image = np.array(image)
 
-    image = image / 255.0  # normalize if used in training
-    image = np.expand_dims(image, axis=0)
+        if image.shape[-1] == 4:
+            image = image[:, :, :3]
 
-    return image
+        image = image / 255.0
+        image = np.expand_dims(image, axis=0)
+
+        return image
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Preprocessing error: {str(e)}")
 
 # -----------------------------
-# Routes
+# Endpoints
 # -----------------------------
-@app.get("/")
+@app.get("/", response_model=HealthResponse)
 def home():
-    return {"message": "Plant Disease Model API is running"}
+    return {"status": "API is running"}
 
-@app.post("/predict")
+@app.get("/health", response_model=HealthResponse)
+def health():
+    return {"status": "healthy"}
+@app.get("/model-info")
+def model_info():
+    try:
+        return {
+            "model_name": "Plant Disease Classifier",
+            "input_shape": str(model.input_shape),
+            "total_classes": len(class_names)
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+@app.post("/predict", response_model=PredictionResponse)
 async def predict(file: UploadFile = File(...)):
     try:
+        # Validate file type
+        if not file.content_type.startswith("image/"):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid file type. Please upload an image."
+            )
+
         # Read image
         contents = await file.read()
-        image = Image.open(io.BytesIO(contents)).convert("RGB")
+
+        try:
+            image = Image.open(io.BytesIO(contents)).convert("RGB")
+        except UnidentifiedImageError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid image file."
+            )
 
         # Preprocess
         input_data = preprocess_image(image)
 
-        # Prediction
-        predictions = model.predict(input_data)
-        predicted_class_index = np.argmax(predictions)
-        confidence = float(np.max(predictions))
+        # Predict
+        predictions = model.predict(input_data)[0]
 
-        predicted_class = class_names[predicted_class_index]
+        # Top 3 predictions
+        top_indices = predictions.argsort()[-3:][::-1]
 
-        return {
-            "class": predicted_class,
-            "confidence": confidence
-        }
+        results = []
+        for i in top_indices:
+            results.append({
+                "class_name": class_names[i],
+                "confidence": float(predictions[i])
+            })
+
+        return {"predictions": results}
+
+    except HTTPException as http_err:
+        raise http_err  # re-raise known errors
 
     except Exception as e:
-        return {"error": str(e)}
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prediction failed: {str(e)}"
+        )
